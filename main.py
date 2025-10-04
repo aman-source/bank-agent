@@ -25,7 +25,7 @@ import os
 # Constants / Time handling
 # ---------------------------
 
-os.environ["ANTHROPIC_API_KEY"] = os.getenv("ANTHROPIC_API_KEY")
+os.environ["ANTHROPIC_API_KEY"] = os.getenv("ANTHROPIC_API_KEY", "")
 IST = pytz.timezone("Asia/Kolkata")
 
 def today_str_ddmmyyyy() -> str:
