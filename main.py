@@ -1,16 +1,26 @@
 # app.py
 import os, json, pathlib
 from datetime import datetime, date
+from functools import lru_cache
 from typing import Optional, List, Literal, Dict, Any
 
 import pytz
 from dateutil.relativedelta import relativedelta
-from fastapi import FastAPI
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 # LangChain (latest)
 from langchain_anthropic import ChatAnthropic
+
+ChatGoogleGenerativeAI = None  # type: ignore[assignment]
+_gemini_import_error: Optional[str] = None
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI as _ChatGoogleGenerativeAI
+except Exception as _exc:  # pragma: no cover - optional dependency
+    _gemini_import_error = str(_exc)
+else:
+    ChatGoogleGenerativeAI = _ChatGoogleGenerativeAI  # type: ignore[assignment]
 # from langchain.prompts import ChatPromptTemplate
 from langchain.schema import StrOutputParser
 from langchain.agents import AgentExecutor, create_tool_calling_agent
@@ -19,13 +29,40 @@ from langchain.tools import tool
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.schema import StrOutputParser  # keep as-is if you like
 from langchain_core.messages import HumanMessage, AIMessage
-import os
 
 # ---------------------------
 # Constants / Time handling
 # ---------------------------
 
 os.environ["ANTHROPIC_API_KEY"] = os.getenv("ANTHROPIC_API_KEY", "")
+_gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
+if _gemini_key:
+    os.environ["GOOGLE_API_KEY"] = _gemini_key
+
+ProviderLiteral = Literal["anthropic", "gemini"]
+
+
+def _gemini_unavailable_reason() -> str:
+    if ChatGoogleGenerativeAI is None:
+        if _gemini_import_error:
+            return (
+                "Gemini support unavailable. Upgrade `google-generativeai` or reinstall "
+                f"`langchain-google-genai` (import error: {_gemini_import_error})."
+            )
+        return "Gemini support unavailable. Missing langchain-google-genai dependency."
+    if not (_gemini_key or os.getenv("GOOGLE_API_KEY")):
+        return (
+            "Gemini support unavailable. Set `GEMINI_API_KEY` or `GOOGLE_API_KEY` in the environment."
+        )
+    return "Gemini support unavailable."
+
+
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+
+AVAILABLE_PROVIDERS: List[ProviderLiteral] = ["anthropic"]
+if ChatGoogleGenerativeAI is not None:
+    AVAILABLE_PROVIDERS.append("gemini")
 IST = pytz.timezone("Asia/Kolkata")
 
 def today_str_ddmmyyyy() -> str:
@@ -247,18 +284,41 @@ class ReportPayload(BaseModel):
         return v
 
 # ---------------------------
-# Anthropic LLM
+# LLM Factory
 # ---------------------------
-def make_llm():
-    # Requires ANTHROPIC_API_KEY in environment
-    return ChatAnthropic(
-        model="claude-3-5-sonnet-20240620",
-        temperature=0,
-        timeout=60,
-        max_tokens=1024,
-    )
-
-llm = make_llm()
+def make_llm(provider: ProviderLiteral):
+    """Return a chat model instance for the requested provider."""
+    if provider == "anthropic":
+        return ChatAnthropic(
+            model="claude-3-5-sonnet-20240620",
+            temperature=0,
+            timeout=60,
+            max_tokens=1024,
+        )
+    if provider == "gemini":
+        if ChatGoogleGenerativeAI is None:
+            raise RuntimeError(_gemini_unavailable_reason())
+        google_api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        if not google_api_key:
+            raise RuntimeError(
+                "Gemini support unavailable. Set `GEMINI_API_KEY` or `GOOGLE_API_KEY` in the environment."
+            )
+        model_name = DEFAULT_GEMINI_MODEL or "gemini-1.5-flash-latest"
+        try:
+            return ChatGoogleGenerativeAI(
+                model=model_name,
+                temperature=0,
+                max_output_tokens=1024,
+                convert_system_message_to_human=True,
+                google_api_key=google_api_key,
+            )
+        except Exception as exc:  # pragma: no cover - provide actionable error
+            raise RuntimeError(
+                "Gemini initialization failed. Verify the model name (set `GEMINI_MODEL`) "
+                "and API key. Original error: "
+                f"{exc}"
+            ) from exc
+    raise ValueError(f"Unsupported provider: {provider}")
 
 def fill_placeholder(template: str, value: str) -> str:
     return template.replace("{0}", value)
@@ -268,94 +328,82 @@ def fill_placeholder(template: str, value: str) -> str:
 # Tools
 # ---------------------------
 
-@tool("IntentClassifier", return_direct=False)
-def intent_classifier(user_query: str) -> str:
-    """
-    Classify the query into one of 1..15 categories as JSON: { "userIntent": "5" }.
-    """
-    prompt = (
-        ChatPromptTemplate.from_messages([
-            ("system", "{rules}"),   # <-- only one placeholder
-            ("human", "{q}")
-        ])
-        .partial(rules=INTENT_PROMPT)  # <-- inject entire prompt text here
-    )
-    chain = prompt | llm | StrOutputParser()
-    out = chain.invoke({"q": user_query})
-    try:
-        data = json.loads(out)
-        if not isinstance(data, dict) or "userIntent" not in data:
-            raise ValueError("Bad intent JSON")
-        return json.dumps({"userIntent": str(data["userIntent"])})
-    except Exception:
-        return json.dumps({"userIntent": "5"})  # safe default
 
-
-@tool("ReceiptPaymentParser", return_direct=False)
-def receipt_payment_parser(user_query: str) -> str:
-    """
-    Parse a receipt/payment into strict JSON TransactionPayload.
-    """
-    today_ddmmyyyy = today_str_ddmmyyyy()
-    sys_text = fill_placeholder(REC_PAY_PROMPT, today_str_ddmmyyyy()) # keep your date injection
-
-    prompt = (
-        ChatPromptTemplate.from_messages([
-            ("system", "{rules}"),   # <-- only one placeholder
-            ("human", "{q}")
-        ])
-        .partial(rules=sys_text)     # <-- inject whole rules blob here
-    )
-
-    chain = prompt | llm | StrOutputParser()
-    raw = chain.invoke({"q": user_query})
-    try:
-        data = json.loads(raw)
-        validated = TransactionPayload(**data)
-        return json.dumps(validated.model_dump())
-    except Exception:
-        fallback = TransactionPayload(date=today_ddmmyyyy, isEdit="")
-        return json.dumps(fallback.model_dump())
-
-
-
-@tool("ReportParser", return_direct=False)
-def report_parser(user_query: str) -> str:
-    """
-    Parse a report request into strict JSON ReportPayload.
-    """
-    today = today_iso()
-    sys_text = fill_placeholder(REPORTS_PROMPT, today_iso())
-
-    prompt = (
-        ChatPromptTemplate.from_messages([
-            ("system", "{rules}"),   # <-- only one placeholder
-            ("human", "{q}")
-        ])
-        .partial(rules=sys_text)     # <-- inject whole rules blob here
-    )
-
-    chain = prompt | llm | StrOutputParser()
-    raw = chain.invoke({"q": user_query})
-    try:
-        data = json.loads(raw)
-        validated = ReportPayload(**data)
-        return json.dumps(validated.model_dump())
-    except Exception:
-        fy_from, fy_to = current_fy_bounds()
-        fallback = ReportPayload(
-            reportName="LA",
-            accountName="",
-            accountName2="",
-            fromDate=fy_from,
-            toDate=fy_to,
-            withStock="N",
+def build_tools(llm):
+    @tool("IntentClassifier", return_direct=False)
+    def intent_classifier(user_query: str) -> str:
+        """Classify the query into one of 1..15 categories as JSON."""
+        prompt = (
+            ChatPromptTemplate.from_messages([
+                ("system", "{rules}"),
+                ("human", "{q}")
+            ]).partial(rules=INTENT_PROMPT)
         )
-        return json.dumps(fallback.model_dump())
+        chain = prompt | llm | StrOutputParser()
+        out = chain.invoke({"q": user_query})
+        try:
+            data = json.loads(out)
+            if not isinstance(data, dict) or "userIntent" not in data:
+                raise ValueError("Bad intent JSON")
+            return json.dumps({"userIntent": str(data["userIntent"])})
+        except Exception:
+            return json.dumps({"userIntent": "5"})
 
+    @tool("ReceiptPaymentParser", return_direct=False)
+    def receipt_payment_parser(user_query: str) -> str:
+        """Parse a receipt/payment into strict JSON TransactionPayload."""
+        today_ddmmyyyy = today_str_ddmmyyyy()
+        sys_text = fill_placeholder(REC_PAY_PROMPT, today_ddmmyyyy)
 
+        prompt = (
+            ChatPromptTemplate.from_messages([
+                ("system", "{rules}"),
+                ("human", "{q}")
+            ]).partial(rules=sys_text)
+        )
 
-TOOLS = [intent_classifier, receipt_payment_parser, report_parser]
+        chain = prompt | llm | StrOutputParser()
+        raw = chain.invoke({"q": user_query})
+        try:
+            data = json.loads(raw)
+            validated = TransactionPayload(**data)
+            return json.dumps(validated.model_dump())
+        except Exception:
+            fallback = TransactionPayload(date=today_ddmmyyyy, isEdit="")
+            return json.dumps(fallback.model_dump())
+
+    @tool("ReportParser", return_direct=False)
+    def report_parser(user_query: str) -> str:
+        """Parse a report request into strict JSON ReportPayload."""
+        today = today_iso()
+        sys_text = fill_placeholder(REPORTS_PROMPT, today)
+
+        prompt = (
+            ChatPromptTemplate.from_messages([
+                ("system", "{rules}"),
+                ("human", "{q}")
+            ]).partial(rules=sys_text)
+        )
+
+        chain = prompt | llm | StrOutputParser()
+        raw = chain.invoke({"q": user_query})
+        try:
+            data = json.loads(raw)
+            validated = ReportPayload(**data)
+            return json.dumps(validated.model_dump())
+        except Exception:
+            fy_from, fy_to = current_fy_bounds()
+            fallback = ReportPayload(
+                reportName="LA",
+                accountName="",
+                accountName2="",
+                fromDate=fy_from,
+                toDate=fy_to,
+                withStock="N",
+            )
+            return json.dumps(fallback.model_dump())
+
+    return [intent_classifier, receipt_payment_parser, report_parser]
 
 # ---------------------------
 # Agent Prompt
@@ -370,27 +418,27 @@ You are a smart bookkeeping assistant.
 - Never wrap JSON in code fences. Output must be just JSON when finalized.
 """
 
-def build_agent():
+@lru_cache(maxsize=4)
+def get_agent(provider: ProviderLiteral) -> AgentExecutor:
+    llm = make_llm(provider)
+    tools = build_tools(llm)
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_DIRECTIVE),
-        MessagesPlaceholder("chat_history"),     # <— was ("placeholder", "{chat_history}")
+        MessagesPlaceholder("chat_history"),
         ("human", "{input}"),
-        MessagesPlaceholder("agent_scratchpad")  # <— was ("placeholder", "{agent_scratchpad}")
+        MessagesPlaceholder("agent_scratchpad")
     ])
     return AgentExecutor(
-        agent=create_tool_calling_agent(llm, TOOLS, prompt),
-        tools=TOOLS,
+        agent=create_tool_calling_agent(llm, tools, prompt),
+        tools=tools,
         verbose=False,
         handle_parsing_errors=True,
     )
 
-
-agent_executor = build_agent()
-
 # ---------------------------
 # Simple in-memory session store
 # ---------------------------
-SESSIONS: Dict[str, List[HumanMessage | AIMessage]] = {}
+SESSIONS: Dict[str, Dict[ProviderLiteral, List[HumanMessage | AIMessage]]] = {}
 
 def history_to_text(history: List[Dict[str, str]]) -> str:
     # Flatten to a simple transcript string for the prompt placeholder
@@ -435,7 +483,7 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"ok": True, "model": "claude-3-5-sonnet-20240620"}
+    return {"ok": True, "providers": AVAILABLE_PROVIDERS}
 
 @app.post("/reset", response_model=dict)
 def reset_session(req: ResetRequest):
@@ -443,12 +491,23 @@ def reset_session(req: ResetRequest):
     return {"status": "reset", "session_id": req.session_id}
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
-    # Initialize or fetch session history as a list of BaseMessages
-    history = SESSIONS.setdefault(req.session_id, [])
+def chat(
+    req: ChatRequest,
+    provider: ProviderLiteral = Query("anthropic", description="LLM provider to use"),
+):
+    if provider not in AVAILABLE_PROVIDERS:
+        raise HTTPException(status_code=503, detail=_gemini_unavailable_reason())
+    try:
+        agent = get_agent(provider)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    # Initialize or fetch session history scoped to provider
+    history_map = SESSIONS.setdefault(req.session_id, {})
+    history = history_map.setdefault(provider, [])
 
     # Call agent with prior history, and current input separately
-    result = agent_executor.invoke({"input": req.query, "chat_history": history})
+    result = agent.invoke({"input": req.query, "chat_history": history})
     raw_out = extract_text_output(result)
 
     # Try to parse strict JSON
@@ -474,7 +533,15 @@ def chat(req: ChatRequest):
         return ChatResponse(type="chat", message=raw_out)
 
 @app.post("/seed", response_model=list)
-def seed_examples():
+def seed_examples(
+    provider: ProviderLiteral = Query("anthropic", description="LLM provider to use"),
+):
+    if provider not in AVAILABLE_PROVIDERS:
+        raise HTTPException(status_code=503, detail=_gemini_unavailable_reason())
+    try:
+        agent = get_agent(provider)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     samples = [
         "Cash received from Sita 2000",
         "paid to varun",
@@ -482,7 +549,7 @@ def seed_examples():
     ]
     outputs = []
     for s in samples:
-        res = agent_executor.invoke({"input": s, "chat_history": []})  # [] not ""
+        res = agent.invoke({"input": s, "chat_history": []})  # [] not ""
         outputs.append(extract_text_output(res))
     return outputs
 
